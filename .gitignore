@@ -2,6 +2,8 @@ node_modules/
 dist/
 .npm-cache/
 release/
+smoke-*.json
+build/icon.iconset/
 src-tauri/target/
 artifacts/
 npm-debug.log*

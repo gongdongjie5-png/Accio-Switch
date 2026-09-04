@@ -24,6 +24,12 @@ import {
   XCircle,
 } from "@phosphor-icons/react";
 
+const defaultMockAccioPath = () => (
+  typeof navigator !== "undefined" && /mac/i.test(navigator.platform)
+    ? "/Applications/Accio.app/Contents/MacOS/Accio"
+    : "C:\\Users\\123\\AppData\\Local\\Programs\\Accio\\Accio.exe"
+);
+
 const DEFAULT_CONFIG = {
   mode: "custom",
   provider: "OpenAI Compatible",
@@ -45,7 +51,7 @@ const DEFAULT_CONFIG = {
   autoStartBridge: true,
   bridgePort: 8787,
   officialGateway: "https://phoenix-gw.alibaba.com",
-  accioPath: "C:\\Users\\123\\AppData\\Local\\Programs\\Accio\\Accio.exe",
+  accioPath: defaultMockAccioPath(),
   updateFeedUrl: "",
   updateCheckOnStart: false,
 };
@@ -607,7 +613,7 @@ export function App() {
                           <input
                             type={showKey ? "text" : "password"}
                             value={config.apiKey}
-                            placeholder={config.apiKeyConfigured ? "Stored in Windows secure storage" : "sk-..."}
+                            placeholder={config.apiKeyConfigured ? "Stored in system secure storage" : "sk-..."}
                             onChange={(event) => update({ apiKey: event.target.value })}
                             disabled={config.mode === "official"}
                           />
@@ -615,7 +621,7 @@ export function App() {
                             {showKey ? <EyeSlash size={18} /> : <Eye size={18} />}
                           </button>
                         </div>
-                        <small>The key is encrypted with Windows secure storage, never written to the config file.</small>
+                        <small>The key is encrypted with the OS secure storage (macOS Keychain / Windows DPAPI), never written to the config file.</small>
                       </label>
                       <label>
                         <span>Default model</span>
@@ -873,7 +879,7 @@ export function App() {
             <p>A local routing companion for Accio Work. It keeps official services intact while redirecting supported LLM traffic through your chosen OpenAI-compatible endpoint.</p>
             <section className="update-card">
               <h3>Updates</h3>
-              <p>Use a static <code>latest.json</code> feed for portable exe updates. The app downloads the new exe and verifies sha256 before launching it.</p>
+              <p>Use a static <code>latest.json</code> feed. The app downloads the release package for your platform and verifies its sha256 before opening it.</p>
               <div className="endpoint-actions">
                 <button className="outline-button" onClick={checkUpdate} disabled={busy || !config.updateFeedUrl}>
                   {busy === "update-check" ? <CircleNotch className="spin" size={17} /> : <SlidersHorizontal size={17} />}

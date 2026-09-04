@@ -106,6 +106,33 @@ Accio Switch 会按功能调用以下接口：
 
 当前主要兼容目标为 **Accio Work 0.16.1**。Accio 使用未公开的内部协议，升级 Accio 后可能需要等待本项目适配。
 
+## macOS 移植版说明
+
+> [!NOTE]
+> 本分支（`mac-port-v0.4.6`）基于上游 Accio-Switch v0.4.6（Windows）做 macOS 移植，**功能与 v0.4.6 对齐**。改动仅限平台壳层，协议转换、Bridge、路由等核心代码与上游保持一致。
+
+### 与 Windows 版的差异
+
+- **Accio 路径**：默认指向 `/Applications/Accio.app/Contents/MacOS/Accio`；若你的 Accio Work 装在其他位置，请在 Settings → `Accio executable` 中指定。
+- **进程启停**：macOS 使用 `pgrep`/`pkill`，Windows 仍用 `tasklist`/`taskkill`。应用会精确跟踪自己启动的 Accio 进程，也能识别手动启动的实例。
+- **密钥存储**：自动使用 macOS Keychain（Electron `safeStorage`），与 Windows DPAPI 逻辑同构。
+- **窗口行为**：macOS 上关闭窗口=隐藏到菜单栏/Dock，Bridge 继续运行；用 `Cmd+Q` 或托盘菜单 `Exit` 退出。
+- **托盘图标**：macOS 使用适配深/浅色菜单栏的 template 图标。
+- **更新机制**：macOS 下载 `.zip` 更新包后自动打开；将新版拖入 `/Applications` 替换旧版再打开即可。
+
+### 构建（macOS）
+
+```bash
+npm install
+npm run mac:icons          # 重新生成菜单栏 template 图标（图标资源改动时才需要）
+npm run electron:build
+# 产物：release/Accio-Switch-<version>-macos-<arch>.zip 和可直接运行的 Accio Switch.app
+```
+
+在 Windows 上执行同一命令仍会产出原便携版 EXE。
+
+> 构建默认跳过代码签名。Apple Silicon 上无签名的应用分发给他人时，对方需要“右键 → 打开”确认；正式分发请通过 `CSC_LINK` / `CSC_KEY_PASSWORD` 配置 Developer ID 签名（及公证）。
+
 ## 安装
 
 1. 打开 [GitHub Releases](https://github.com/xyh9949/Accio-Switch/releases/latest)。

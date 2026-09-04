@@ -15,7 +15,9 @@
     "electron": "electron electron/main.cjs",
     "electron:dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron electron/main.cjs\"",
     "electron:build": "npm run build && node scripts/build-electron.mjs",
-    "test": "node --test electron/protocol.test.cjs"
+    "test": "node --test electron/protocol.test.cjs",
+    "mac:icons": "electron scripts/generate-mac-tray-icons.cjs",
+    "smoke": "npm run build && ACCIO_SWITCH_SMOKE=./smoke-report.json electron electron/main.cjs"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
@@ -43,11 +45,6 @@
     ],
     "directories": {
       "output": "release"
-    },
-    "win": {
-      "target": "portable",
-      "icon": "assets/accio-switch.ico",
-      "artifactName": "Accio-Switch-${version}.exe"
     }
   }
 }

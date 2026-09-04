@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, Menu, safeStorage, shell, Tray } = require("electron");
+const { app, BrowserWindow, ipcMain, Menu, nativeImage, safeStorage, shell, Tray } = require("electron");
 const { execFile, spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const { promisify } = require("node:util");
@@ -75,6 +75,18 @@ const ENDPOINT_TEST_TIMEOUT_MS = 20_000;
 const BRIDGE_PORT_SEARCH_LIMIT = 20;
 const SSE_HEARTBEAT_INTERVAL_MS = 15_000;
 
+function defaultAccioPath() {
+  if (process.platform === "darwin") {
+    const candidates = [
+      path.join("/Applications", "Accio.app", "Contents", "MacOS", "Accio"),
+      path.join(os.homedir(), "Applications", "Accio.app", "Contents", "MacOS", "Accio"),
+    ];
+    return candidates.find((candidate) => fs.existsSync(candidate))
+      || path.join("/Applications", "Accio.app", "Contents", "MacOS", "Accio");
+  }
+  return path.join(process.env.LOCALAPPDATA || "", "Programs", "Accio", "Accio.exe");
+}
+
 const DEFAULT_CONFIG = {
   mode: "custom",
   provider: "OpenAI Compatible",
@@ -97,7 +109,7 @@ const DEFAULT_CONFIG = {
   autoStartBridge: true,
   bridgePort: 8787,
   officialGateway: "https://phoenix-gw.alibaba.com",
-  accioPath: path.join(process.env.LOCALAPPDATA || "", "Programs", "Accio", "Accio.exe"),
+  accioPath: defaultAccioPath(),
   updateFeedUrl: "",
   updateCheckOnStart: false,
 };
@@ -112,9 +124,13 @@ let tray = null;
 let trayHintShown = false;
 let accioRoutingVerified = false;
 let alibabaAccountConnected = false;
+let launchedAccioPid = null;
+let quitting = false;
 const execFileAsync = promisify(execFile);
 
-const allowMultipleInstances = Boolean(process.env.ACCIO_SWITCH_CAPTURE || process.env.ACCIO_SWITCH_SMOKE);
+const allowMultipleInstances = Boolean(
+  process.env.ACCIO_SWITCH_CAPTURE || process.env.ACCIO_SWITCH_SMOKE || process.env.ACCIO_SWITCH_E2E,
+);
 const singleInstanceLock = allowMultipleInstances || app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
   app.quit();
@@ -173,13 +189,13 @@ function loadConfig() {
 function saveConfig(next) {
   config = { ...config, ...next };
   if (next.apiKey?.trim()) {
-    if (!safeStorage.isEncryptionAvailable()) throw new Error("Windows secure storage is not available");
+    if (!safeStorage.isEncryptionAvailable()) throw new Error("System secure storage is not available");
     apiKey = next.apiKey.trim();
     fs.mkdirSync(path.dirname(storagePaths().key), { recursive: true });
     fs.writeFileSync(storagePaths().key, safeStorage.encryptString(apiKey));
   }
   if (next.imageApiKey?.trim()) {
-    if (!safeStorage.isEncryptionAvailable()) throw new Error("Windows secure storage is not available");
+    if (!safeStorage.isEncryptionAvailable()) throw new Error("System secure storage is not available");
     imageApiKey = next.imageApiKey.trim();
     fs.mkdirSync(path.dirname(storagePaths().imageKey), { recursive: true });
     fs.writeFileSync(storagePaths().imageKey, safeStorage.encryptString(imageApiKey));
@@ -193,26 +209,58 @@ function saveConfig(next) {
   log("INFO", "Configuration saved");
 }
 
+function accioProcessName() {
+  // macOS pgrep/pkill -x do an exact, case-sensitive process-name match, so the
+  // basename must keep its original casing ("Accio", not "accio").
+  const executableName = path.basename(config.accioPath || "");
+  return executableName.replace(/\.exe$/i, "") || "accio";
+}
+
+function accioImageName() {
+  return path.basename(config.accioPath || "Accio.exe") || "Accio.exe";
+}
+
 async function isAccioRunning() {
-  const imageName = path.basename(config.accioPath || "Accio.exe");
+  if (process.platform === "win32") {
+    const imageName = accioImageName();
+    try {
+      const { stdout } = await execFileAsync("tasklist.exe", ["/FI", `IMAGENAME eq ${imageName}`, "/FO", "CSV", "/NH"], {
+        windowsHide: true,
+      });
+      return stdout.toLowerCase().includes(`"${imageName.toLowerCase()}"`);
+    } catch {
+      return false;
+    }
+  }
+  // macOS / Linux: prefer the exact pid we spawned, then fall back to a name lookup
+  // so manually launched Accio instances are detected too.
+  if (launchedAccioPid) {
+    try {
+      process.kill(launchedAccioPid, 0);
+      return true;
+    } catch {
+      launchedAccioPid = null;
+    }
+  }
   try {
-    const { stdout } = await execFileAsync("tasklist.exe", ["/FI", `IMAGENAME eq ${imageName}`, "/FO", "CSV", "/NH"], {
-      windowsHide: true,
-    });
-    return stdout.toLowerCase().includes(`"${imageName.toLowerCase()}"`);
+    const { stdout } = await execFileAsync("pgrep", ["-x", accioProcessName()]);
+    return stdout.trim().length > 0;
   } catch {
     return false;
   }
 }
 
 async function stopAccioProcess() {
-  const imageName = path.basename(config.accioPath || "Accio.exe");
   if (!(await isAccioRunning())) {
     accioRoutingVerified = false;
     return false;
   }
   try {
-    await execFileAsync("taskkill.exe", ["/IM", imageName, "/F", "/T"], { windowsHide: true });
+    if (process.platform === "win32") {
+      await execFileAsync("taskkill.exe", ["/IM", accioImageName(), "/F", "/T"], { windowsHide: true });
+    } else {
+      await execFileAsync("pkill", ["-x", accioProcessName()]);
+    }
   } catch (error) {
     throw new Error(`Unable to stop Accio Work: ${error.message}`);
   }
@@ -222,6 +270,17 @@ async function stopAccioProcess() {
       return true;
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  if (process.platform !== "win32") {
+    // Escalate to SIGKILL on macOS / Linux so a stuck GUI process cannot block routing.
+    await execFileAsync("pkill", ["-9", "-x", accioProcessName()]).catch(() => {});
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      if (!(await isAccioRunning())) {
+        accioRoutingVerified = false;
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
   }
   throw new Error("Accio Work did not exit in time");
 }
@@ -298,7 +357,9 @@ async function launchAccioProcess() {
     delete env.EMBEDDING_MODEL;
   }
   const launchedAt = Date.now();
-  spawn(config.accioPath, [], { env, detached: true, stdio: "ignore", windowsHide: false }).unref();
+  const child = spawn(config.accioPath, [], { env, detached: true, stdio: "ignore", windowsHide: false });
+  launchedAccioPid = child.pid;
+  child.unref();
   if (config.mode === "custom") {
     try {
       await verifyAccioGateway(launchedAt);
@@ -808,7 +869,8 @@ async function downloadUpdate(feedUrl = config.updateFeedUrl) {
   }
   const updatesDir = storagePaths().updates;
   fs.mkdirSync(updatesDir, { recursive: true });
-  const fileName = path.basename(new URL(update.url).pathname) || `Accio-Switch-${update.version}.exe`;
+  const updateArtifactExtension = process.platform === "win32" ? ".exe" : ".zip";
+  const fileName = path.basename(new URL(update.url).pathname) || `Accio-Switch-${update.version}${updateArtifactExtension}`;
   const filePath = path.join(updatesDir, fileName);
   fs.writeFileSync(filePath, bytes);
   log("INFO", `Downloaded update ${update.version} to ${filePath}`);
@@ -821,14 +883,24 @@ async function downloadUpdate(feedUrl = config.updateFeedUrl) {
   };
 }
 
-function launchDownloadedUpdate(filePath) {
+async function launchDownloadedUpdate(filePath) {
   const updatesDir = path.resolve(storagePaths().updates);
   const resolved = path.resolve(filePath || "");
   if (!resolved.startsWith(updatesDir + path.sep)) throw new Error("Update file is outside the updates directory");
   if (!fs.existsSync(resolved)) throw new Error(`Update file not found: ${resolved}`);
-  spawn(resolved, [], { detached: true, stdio: "ignore", windowsHide: false }).unref();
-  log("INFO", `Launching downloaded update: ${path.basename(resolved)}`);
-  setTimeout(() => app.quit(), 500);
+  if (process.platform === "win32") {
+    // Windows portable build: launch the new exe and quit so it takes over.
+    spawn(resolved, [], { detached: true, stdio: "ignore", windowsHide: false }).unref();
+    log("INFO", `Launching downloaded update: ${path.basename(resolved)}`);
+    setTimeout(() => app.quit(), 500);
+    return { launched: true };
+  }
+  // macOS: open the downloaded archive (Finder / Archive Utility) so the user
+  // can replace the app bundle in /Applications, then quit this instance.
+  const errorMessage = await shell.openPath(resolved);
+  if (errorMessage) throw new Error(`Unable to open update package: ${errorMessage}`);
+  log("INFO", `Opened downloaded update package: ${path.basename(resolved)}`);
+  setTimeout(() => app.quit(), 800);
   return { launched: true };
 }
 
@@ -1267,6 +1339,13 @@ function createWindow() {
       });
     }
   });
+  window.on("close", (event) => {
+    if (allowMultipleInstances || quitting || process.platform !== "darwin") return;
+    // macOS convention: closing the window keeps Accio Switch running so the
+    // Bridge and menu bar item stay available. Cmd+Q / Exit still quit.
+    event.preventDefault();
+    window.hide();
+  });
   window.on("closed", () => {
     if (mainWindow === window) mainWindow = null;
   });
@@ -1328,7 +1407,14 @@ function createWindow() {
 
 function createTray() {
   if (tray || allowMultipleInstances) return;
-  tray = new Tray(path.join(__dirname, "tray-icon.png"));
+  let trayImage;
+  if (process.platform === "darwin") {
+    trayImage = nativeImage.createFromPath(path.join(__dirname, "tray-iconTemplate.png"));
+    trayImage.setTemplateImage(true);
+  } else {
+    trayImage = nativeImage.createFromPath(path.join(__dirname, "tray-icon.png"));
+  }
+  tray = new Tray(trayImage);
   tray.setToolTip("Accio Switch");
   const buildMenu = async () => {
     const accioRunning = await isAccioRunning();
@@ -1380,16 +1466,73 @@ app.whenReady().then(() => {
   if (process.platform === "win32") app.setAppUserModelId("com.accioswitch.desktop");
   loadConfig();
   registerIpc();
+  if (process.env.ACCIO_SWITCH_E2E) {
+    // Diagnostic mode: take over Accio without showing a window or tray.
+    runE2EDiagnostic(process.env.ACCIO_SWITCH_E2E);
+    return;
+  }
   createWindow();
   createTray();
 });
+
+/**
+ * E2E 诊断模式（ACCIO_SWITCH_E2E=<json>）：
+ *  - payload.config（可选）白名单字段会被保存（含 apiKey，走 safeStorage）；
+ *  - 随后启动 Bridge 并重启 Accio（custom 模式注入网关 env 并校验 sdk.log）；
+ *  - 结果写入 payload.report；进程保持存活，由外部负责收尾（SIGTERM 退出）。
+ * 仅供真机验收/回归，普通启动不受影响。
+ */
+async function runE2EDiagnostic(jsonPath) {
+  const startedAt = new Date().toISOString();
+  const report = { startedAt, pid: process.pid };
+  try {
+    const payload = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+    if (payload.config) {
+      const next = {};
+      for (const field of ["mode", "provider", "baseUrl", "model", "embeddingModel", "bridgePort"]) {
+        if (payload.config[field] !== undefined) next[field] = payload.config[field];
+      }
+      if (payload.config.apiKey) next.apiKey = payload.config.apiKey;
+      saveConfig(next);
+      report.savedConfig = { ...config, apiKey: "", apiKeyConfigured: Boolean(apiKey) };
+    }
+    report.bridgePort = await startBridge();
+    report.launchMessage = await launchOrRestartAccio();
+    report.verify = await runtimeStatus();
+    report.ok = true;
+  } catch (error) {
+    report.ok = false;
+    report.error = String(error?.message || error);
+    await stopAccioProcess().catch(() => {});
+  }
+  report.finishedAt = new Date().toISOString();
+  report.logs = logs;
+  try {
+    const reportPath = JSON.parse(fs.readFileSync(jsonPath, "utf8")).report;
+    if (reportPath) {
+      fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+      fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+    }
+  } catch {}
+  if (report.ok) log("WARN", `E2E diagnostic ready on bridge ${report.bridgePort}; keeping process alive`);
+}
 
 app.on("window-all-closed", async () => {
   await stopBridge();
   if (process.platform !== "darwin") app.quit();
 });
 
+app.on("activate", () => {
+  // macOS: restore the window from the Dock when none is visible.
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    showMainWindow();
+  } else if (process.platform === "darwin") {
+    createWindow();
+  }
+});
+
 app.on("before-quit", () => {
+  quitting = true;
   tray?.destroy();
   tray = null;
 });

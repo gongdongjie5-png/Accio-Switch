@@ -598,6 +598,14 @@ function buildToolRepairRequest(request, invalidCall) {
   };
 }
 
+function partialTextFrame(text) {
+  return {
+    content: { role: "model", parts: [{ text }] },
+    turnComplete: false,
+    partial: true,
+  };
+}
+
 function openSseResponse(res, status = 200) {
   if (res.headersSent) return;
   res.writeHead(status, {
@@ -633,6 +641,7 @@ module.exports = {
   openSseResponse,
   openAIToAccio,
   parseProviderBody,
+  partialTextFrame,
   requestedModelFromAccio,
   sseResponse,
 };

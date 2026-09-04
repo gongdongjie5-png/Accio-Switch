@@ -12,6 +12,7 @@ const {
   openSseResponse,
   openAIToAccio,
   parseProviderBody,
+  partialTextFrame,
   requestedModelFromAccio,
   sseResponse,
   toolResultContent,
@@ -629,4 +630,16 @@ test("preserves final image payload in streamed Images API responses", () => {
   ].join("\n");
   const payload = parseProviderBody(body, "text/event-stream");
   assert.equal(payload.data[0].b64_json, "YWJj");
+});
+
+test("builds streaming partial frames carrying incremental text", () => {
+  const first = partialTextFrame("你");
+  assert.equal(first.content.role, "model");
+  assert.equal(first.content.parts[0].text, "你");
+  assert.equal(first.turnComplete, false);
+  assert.equal(first.partial, true);
+  const second = partialTextFrame("你好");
+  assert.equal(second.content.parts[0].text, "你好");
+  assert.equal(second.turnComplete, false);
+  assert.equal(second.partial, true);
 });

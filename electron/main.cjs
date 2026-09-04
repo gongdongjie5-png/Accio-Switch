@@ -7,6 +7,7 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const { Readable } = require("node:stream");
+const { createInterface } = require("node:readline");
 const packageInfo = require("../package.json");
 const {
   accioToOpenAI,
@@ -16,9 +17,11 @@ const {
   imageFrame,
   imageSizeForOpenAI,
   isImageOutputRequest,
+  mergeOpenAIChunks,
   openSseResponse,
   openAIToAccio,
   parseProviderBody,
+  partialTextFrame,
   sseResponse,
 } = require("./protocol.cjs");
 const {
@@ -585,6 +588,69 @@ async function requestProvider(providerRequest, { timeoutMs = 0 } = {}) {
   throw new Error("Provider request failed after retry");
 }
 
+function streamContentDelta(chunk) {
+  const choice = chunk?.choices?.[0];
+  if (!choice) return "";
+  const delta = choice.delta || choice.message || {};
+  return typeof delta.content === "string" ? delta.content : "";
+}
+
+async function requestProviderStream(providerRequest, { onChunk } = {}) {
+  const requestBody = JSON.stringify(providerRequest);
+  const url = `${normalizedBaseUrl(config.baseUrl)}/chat/completions`;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+        body: requestBody,
+      });
+    } catch (error) {
+      throw error;
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (!response.ok) {
+      const responseText = await response.text();
+      const providerError = parseProviderErrorMessage(responseText);
+      const upstreamStatus = responseText.match(/"message"\s*:\s*"(5\d\d)"/i)?.[1];
+      const upstreamError = responseText.match(/"type"\s*:\s*"upstream_error"/i);
+      const transient = (response.status >= 500 && response.status <= 599)
+        || (response.status === 429 && upstreamError && upstreamStatus);
+      if (transient && attempt === 1 && response.status !== 504 && requestBody.length <= 120000) {
+        log("WARN", `Provider HTTP ${response.status}${upstreamStatus ? ` upstream ${upstreamStatus}` : ""}; retrying custom endpoint once (${requestBody.length} request chars)`);
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        continue;
+      }
+      throw new Error(`Provider HTTP ${response.status}: ${providerError || responseText.slice(0, 240)}`);
+    }
+    const isEventStream = contentType.includes("text/event-stream")
+      || contentType.includes("application/x-ndjson");
+    if (!isEventStream) {
+      const responseText = await response.text();
+      return { payload: parseProviderBody(responseText, contentType), streamed: false };
+    }
+    const chunks = [];
+    const lines = createInterface({ input: Readable.fromWeb(response.body), crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      let chunk;
+      try {
+        chunk = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      chunks.push(chunk);
+      onChunk?.(chunk);
+    }
+    if (!chunks.length) throw new Error("Provider returned an empty event stream");
+    return { payload: mergeOpenAIChunks(chunks), streamed: true };
+  }
+  throw new Error("Provider request failed after retry");
+}
+
 function parseProviderErrorMessage(responseText = "") {
   try {
     const payload = JSON.parse(responseText);
@@ -694,7 +760,7 @@ function isLikelyProviderTimeout(error) {
   return /Provider HTTP (?:504|524|522|502|503)|Gateway Time-out|timeout|timed out/i.test(message);
 }
 
-async function callCustomLLM(input) {
+async function callCustomLLM(input, { onPartialText } = {}) {
   if (!apiKey) throw new Error("API key is not configured");
   const started = Date.now();
   const accioToolSummary = summarizeAccioToolInputs(input);
@@ -707,27 +773,43 @@ async function callCustomLLM(input) {
     log("INFO", `Accio selected ${selectedModel}; Switch default is ${config.model}`);
   }
   log("INFO", `LLM request: model=${selectedModel}, messages=${providerRequest.messages.length}, tools=${providerRequest.tools?.length || 0}, requestChars=${requestChars}${summarizeToolResults(providerRequest.messages)}`);
-  let payload;
+  let accumulatedText = "";
+  let textEmitted = false;
+  async function runProvider(request, { emitText = true } = {}) {
+    return requestProviderStream(request, {
+      onChunk: (chunk) => {
+        const piece = streamContentDelta(chunk);
+        if (typeof piece !== "string" || !piece.length) return;
+        accumulatedText += piece;
+        if (emitText && onPartialText) {
+          textEmitted = true;
+          onPartialText(accumulatedText);
+        }
+      },
+    });
+  }
+  let result;
   try {
-    payload = await requestProvider(providerRequest);
+    result = await runProvider(providerRequest);
   } catch (error) {
-    if (!isLikelyProviderTimeout(error) || sizedRequest.index >= PROVIDER_REQUEST_LIMITS.length - 1) throw error;
+    if (!isLikelyProviderTimeout(error) || textEmitted || sizedRequest.index >= PROVIDER_REQUEST_LIMITS.length - 1) throw error;
     const fallbackRequest = buildSizedProviderRequest(input, sizedRequest.index + 1);
     providerRequest = fallbackRequest.request;
     requestChars = fallbackRequest.chars;
     sizedRequest = fallbackRequest;
     log("WARN", `Provider timed out; retrying with ${sizedRequest.level.label} request (${requestChars} chars, max_tokens=${providerRequest.max_tokens})`);
-    payload = await requestProvider(providerRequest);
+    result = await runProvider(providerRequest);
   }
-  let converted = openAIToAccio(payload, selectedModel);
+  let converted = openAIToAccio(result.payload, selectedModel);
   const invalidCalls = findInvalidToolCalls(converted, providerRequest.tools);
   if (invalidCalls.length) {
     const invalid = invalidCalls[0];
     const repairRequest = buildToolRepairRequest(providerRequest, invalid);
     if (!repairRequest) throw new Error(`Cannot repair unknown tool call: ${invalid.name}`);
+    if (textEmitted) throw new Error(`Cannot repair ${invalid.name} tool call after partial text was streamed to Accio`);
     log("WARN", `Repairing ${invalid.name} tool call; missing arguments: ${invalid.missing.join(", ")}`);
-    payload = await requestProvider(repairRequest);
-    converted = openAIToAccio(payload, selectedModel);
+    result = await runProvider(repairRequest, { emitText: false });
+    converted = openAIToAccio(result.payload, selectedModel);
     const repairedCalls = converted.content.parts.filter((part) => part.functionCall?.name === invalid.name);
     const remainingInvalid = findInvalidToolCalls(converted, repairRequest.tools);
     if (!repairedCalls.length || remainingInvalid.length) {
@@ -744,7 +826,7 @@ async function callCustomLLM(input) {
     const keys = Object.keys(args);
     return `${part.functionCall.name}(${keys.join(",") || "no args"})`;
   }).join(", ");
-  log("INFO", `${selectedModel} completed through ${config.provider} in ${Date.now() - started} ms (${textLength} text chars, ${toolCalls.length} tool calls${toolSummary ? `: ${toolSummary}` : ""})`);
+  log("INFO", `${selectedModel} completed through ${config.provider} in ${Date.now() - started} ms (${textLength} text chars, ${toolCalls.length} tool calls${toolSummary ? `: ${toolSummary}` : ""})${result.streamed ? ", streamed" : ""}`);
   return converted;
 }
 
@@ -1068,7 +1150,11 @@ async function handleBridge(req, res) {
         stopKeepAlive();
         return sseResponse(res, 200, [frame]);
       }
-      const frame = await callCustomLLM(input);
+      const frame = await callCustomLLM(input, {
+        onPartialText: (text) => {
+          res.write(`data: ${JSON.stringify(partialTextFrame(text))}\n\n`);
+        },
+      });
       stopKeepAlive();
       return sseResponse(res, 200, [frame]);
     } catch (error) {
